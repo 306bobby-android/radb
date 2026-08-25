@@ -160,6 +160,8 @@ func link(ctx context.Context, args []string, log *slog.Logger) error {
 	fbPort := fs.Int("fastboot-port", remote.DefaultFastbootPort, "port the remote side should use for fastboot")
 	proxyPort := fs.Int("adb-proxy-port", remote.DefaultProxyPort,
 		"local port the adb traffic lands on; 5038 is radb's proxy, 5037 the bare adb server")
+	fbLocal := fs.Int("fastboot-local-port", remote.DefaultFastbootPort,
+		"local port the fastboot bridge listens on")
 	fs.Parse(args)
 
 	rest := fs.Args()
@@ -172,7 +174,7 @@ func link(ctx context.Context, args []string, log *slog.Logger) error {
 		Forwards: []remote.Forward{
 			// The remote keeps adb's usual port; locally it lands on the proxy.
 			{Remote: *adbPort, Local: *proxyPort},
-			{Remote: *fbPort, Local: *fbPort},
+			{Remote: *fbPort, Local: *fbLocal},
 		},
 		Args: rest[1:], // anything further goes straight to ssh
 		Log:  log,

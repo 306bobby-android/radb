@@ -118,6 +118,10 @@ disagreement (a stand-in server reporting 40 to a client expecting 41): the
 client sent `host:kill`, the proxy refused it, zero kills reached the server, and
 the client printed the explanation above.
 
+The whole path was then run over a real ssh reverse tunnel into a throwaway sshd
+left at its stock forwarding defaults -- device list, `host-features`, the
+refused kill and its message, and a fastboot command reaching the bridge.
+
 The unit tests cover the packet framing and the command state machine against a
 scripted bootloader, including the invariant that makes `fetch` work: an upload
 payload has to leave as exactly one packet, because the host reads it in chunks
