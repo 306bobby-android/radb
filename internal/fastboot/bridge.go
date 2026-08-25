@@ -103,3 +103,13 @@ func serveNoDevice(conn net.Conn, reason string) {
 		}
 	}
 }
+
+// InUse reports whether a client currently holds the bootloader, so that
+// callers can avoid touching USB underneath an active flash.
+func (b *Bridge) InUse() bool {
+	if b.usb.TryLock() {
+		b.usb.Unlock()
+		return false
+	}
+	return true
+}

@@ -31,8 +31,8 @@ Needs Go and libusb.
 
 On the machine with the device plugged in:
 
-    radb serve                 # fastboot bridge on 127.0.0.1:5554, plus adb's server
-    radb link me@build-box     # ssh reverse tunnel for 5037 and 5554, kept alive
+    radb serve                 # fastboot bridge (5554) and adb proxy (5038)
+    radb link me@build-box     # ssh reverse tunnel, kept alive
 
 On the remote machine:
 
@@ -71,10 +71,37 @@ without root from a desktop session. A `radb serve` started as a system service
 with no session has no such ACL and needs a udev rule granting your group access
 to the bootloader (`18d1:4ee0` for Pixels).
 
+**A device in the bootloader is invisible to adb.** A remote `adb devices` goes
+quiet at exactly the moment you want to know where the device went. The proxy
+fills that silence in, which is what the extra entries below are for.
+
 **Which fastboot commands exist is up to the device.** `fetch` needs userspace
 fastbootd and an unlocked device, and bootloaders restrict which partitions it
 will read. `get_staged` is frequently unimplemented. The bridge relays whatever
 the bootloader says, including its refusals.
+
+## The device list as a status channel
+
+Both columns of `adb devices` are free text that the client prints without
+interpreting, so the proxy uses them to explain states that would otherwise be an
+empty list:
+
+    List of devices attached
+    0A021FDD4005CG                  device
+    radb-ADB-VERSION-MISMATCH       a-client-tried-to-kill-this-v41-server-at-10:16:04
+
+and, when the device has gone into its bootloader:
+
+    0A021FDD4005CG                  in-fastboot-mode-use-fastboot-not-adb
+
+Real devices are always listed first and untouched. Note the reach of each
+channel: the version check runs before `host:devices`, so a client that fails it
+never asks for the list and only ever sees the `error:` line above. The entry is
+a breadcrumb for whoever looks next -- a healthy client, or `radb doctor`, which
+reports the same incidents with full timestamps.
+
+Pass `-inject=false` to `radb serve` if anything you run parses `adb devices`
+strictly enough to object.
 
 ## Verified against
 
@@ -85,6 +112,11 @@ A Pixel 5 (`redfin`), unlocked, over the bridge with stock `fastboot` 37.0.0:
 - upload data phase — `fetch vendor_boot_b`, 96 MiB, twice, byte-identical
   (`sha256 eb3058d8…`), ~40 MB/s
 - `FAIL` relaying, `reboot`, `reboot fastboot`
+
+The adb half was checked against a real client driven into a genuine version
+disagreement (a stand-in server reporting 40 to a client expecting 41): the
+client sent `host:kill`, the proxy refused it, zero kills reached the server, and
+the client printed the explanation above.
 
 The unit tests cover the packet framing and the command state machine against a
 scripted bootloader, including the invariant that makes `fetch` work: an upload

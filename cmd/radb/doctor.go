@@ -3,8 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ func doctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	adbPort := fs.Int("adb-port", remote.DefaultADBPort, "adb server port to probe")
 	fbPort := fs.Int("fastboot-port", remote.DefaultFastbootPort, "fastboot bridge port to probe")
+	proxyPort := fs.Int("adb-proxy-port", remote.DefaultProxyPort, "adb proxy port to probe")
 	fs.Parse(args)
 
 	adbVer := checkADB()
@@ -25,6 +28,7 @@ func doctor(args []string) error {
 	checkADBDevices()
 	checkFastbootUSB()
 	checkBridge(*fbPort)
+	checkProxy(*proxyPort)
 
 	fmt.Println()
 	fmt.Println("On the remote machine:")
@@ -32,11 +36,53 @@ func doctor(args []string) error {
 	fmt.Printf("  export RADB_FASTBOOT=tcp:127.0.0.1:%d\n", *fbPort)
 	if adbVer != "" {
 		fmt.Println()
-		fmt.Printf("  The remote adb client must be %s as well. A client that finds a\n", adbVer)
-		fmt.Println("  different server version kills the server and starts its own -- which it")
-		fmt.Println("  cannot do across the tunnel, so the mismatch shows up as a dead connection.")
+		fmt.Printf("  The remote adb client should be %s. A client that disagrees about the\n", adbVer)
+		fmt.Println("  server version tries to kill the server and start its own; the proxy")
+		fmt.Println("  refuses, tells that client why, and records it here.")
 	}
 	return nil
+}
+
+// checkProxy asks the proxy for its own report, which is where refused kill
+// attempts -- the fingerprint of a version mismatch -- are recorded.
+func checkProxy(port int) {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		warn("adb proxy not listening on %s (the tunnel would be pointed here)", addr)
+		return
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	req := "radb:status"
+	if _, err := fmt.Fprintf(conn, "%04x%s", len(req), req); err != nil {
+		bad("adb proxy on %s did not accept a status request: %v", addr, err)
+		return
+	}
+	buf := make([]byte, 8192)
+	n, _ := io.ReadFull(conn, buf[:8])
+	if n < 8 || string(buf[:4]) != "OKAY" {
+		bad("something is listening on %s but it is not the radb proxy", addr)
+		return
+	}
+	size, err := strconv.ParseUint(string(buf[4:8]), 16, 32)
+	if err != nil {
+		bad("adb proxy on %s sent a malformed reply", addr)
+		return
+	}
+	body := make([]byte, size)
+	io.ReadFull(conn, body)
+
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	ok("adb proxy on %s: %s", addr, lines[0])
+	for _, l := range lines[1:] {
+		if strings.Contains(l, "no client has tried") {
+			ok("%s", l)
+		} else {
+			warn("%s", l)
+		}
+	}
 }
 
 func ok(format string, a ...any)   { fmt.Printf("  ok    %s\n", fmt.Sprintf(format, a...)) }

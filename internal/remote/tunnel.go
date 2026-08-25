@@ -17,16 +17,25 @@ import (
 const (
 	DefaultADBPort      = 5037
 	DefaultFastbootPort = 5554
+	// DefaultProxyPort is where radb's adb proxy listens on the device host.
+	// The real adb server keeps 5037 to itself, so anything local is
+	// unaffected; only the tunnel is pointed at the proxy.
+	DefaultProxyPort = 5038
 )
+
+// A Forward maps a port on the remote server's loopback to one on this machine.
+type Forward struct {
+	Remote int
+	Local  int
+}
 
 // Tunnel keeps an ssh reverse forward alive, so that connecting to a port on
 // the remote server's loopback reaches the matching port on this machine.
 type Tunnel struct {
 	// Target is the ssh destination, e.g. "bobby@build-box".
 	Target string
-	// Ports are forwarded remote-loopback to local-loopback, same number on
-	// both ends.
-	Ports []int
+	// Forwards are the reverse forwards to keep open.
+	Forwards []Forward
 	// Args are extra options handed to ssh, e.g. []string{"-p", "2222"}.
 	Args []string
 	Log  *slog.Logger
@@ -44,8 +53,8 @@ func (t *Tunnel) command(ctx context.Context) *exec.Cmd {
 		"-o", "ServerAliveInterval=20",
 		"-o", "ServerAliveCountMax=3",
 	}
-	for _, p := range t.Ports {
-		args = append(args, "-R", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", p, p))
+	for _, f := range t.Forwards {
+		args = append(args, "-R", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", f.Remote, f.Local))
 	}
 	args = append(args, t.Args...)
 	args = append(args, t.Target)
@@ -71,7 +80,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		t.Log.Info("connecting", "target", t.Target, "ports", t.Ports)
+		t.Log.Info("connecting", "target", t.Target, "forwards", t.Forwards)
 		start := time.Now()
 		err := t.command(ctx).Run()
 		if ctx.Err() != nil {

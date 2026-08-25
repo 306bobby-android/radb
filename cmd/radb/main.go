@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bobbypanarisi/radb/internal/adbproxy"
 	"github.com/bobbypanarisi/radb/internal/fastboot"
 	"github.com/bobbypanarisi/radb/internal/remote"
 )
@@ -81,6 +82,12 @@ func serve(ctx context.Context, args []string, log *slog.Logger) error {
 	serial := fs.String("s", "", "USB serial of the bootloader to bridge, when several are attached")
 	timeout := fs.Duration("timeout", 10*time.Minute, "bound on a single USB transfer")
 	startADB := fs.Bool("adb", true, "also make sure the local adb server is running")
+	proxyAddr := fs.String("adb-proxy", fmt.Sprintf("127.0.0.1:%d", remote.DefaultProxyPort),
+		"address for the adb proxy that the tunnel should point at; empty to disable it")
+	upstream := fs.String("adb-upstream", fmt.Sprintf("127.0.0.1:%d", remote.DefaultADBPort),
+		"the real adb server the proxy forwards to")
+	inject := fs.Bool("inject", true,
+		"let the proxy add explanatory entries to `adb devices` for states that would otherwise be an empty list")
 	verbose := fs.Bool("v", false, "log every fastboot command")
 	fs.Parse(args)
 
@@ -107,13 +114,52 @@ func serve(ctx context.Context, args []string, log *slog.Logger) error {
 	log.Info("fastboot bridge listening", "addr", ln.Addr().String())
 
 	b := &fastboot.Bridge{Serial: *serial, Timeout: *timeout, Log: log}
+
+	if *proxyAddr != "" {
+		pln, err := net.Listen("tcp", *proxyAddr)
+		if err != nil {
+			return fmt.Errorf("listen on %s: %w", *proxyAddr, err)
+		}
+		defer pln.Close()
+		p := &adbproxy.Proxy{
+			Upstream: *upstream,
+			Log:      log,
+			Inject:   *inject,
+			// A device sitting in the bootloader is invisible to adb, which is
+			// why a remote `adb devices` goes quiet at exactly the moment you
+			// most want to know what happened to it.
+			Bootloaders: func() []string {
+				if b.InUse() {
+					return nil // do not enumerate USB under an active flash
+				}
+				list, err := fastboot.List()
+				if err != nil {
+					return nil
+				}
+				out := make([]string, 0, len(list))
+				for _, d := range list {
+					out = append(out, d.Serial)
+				}
+				return out
+			},
+		}
+		log.Info("adb proxy listening", "addr", pln.Addr().String(), "upstream", *upstream)
+		go func() {
+			if err := p.Serve(ctx, pln); err != nil {
+				log.Error("adb proxy stopped", "err", err)
+			}
+		}()
+	}
+
 	return b.Serve(ctx, ln)
 }
 
 func link(ctx context.Context, args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("link", flag.ExitOnError)
-	adbPort := fs.Int("adb-port", remote.DefaultADBPort, "port to forward for the adb server")
-	fbPort := fs.Int("fastboot-port", remote.DefaultFastbootPort, "port to forward for the fastboot bridge")
+	adbPort := fs.Int("adb-port", remote.DefaultADBPort, "port the remote side should use for adb")
+	fbPort := fs.Int("fastboot-port", remote.DefaultFastbootPort, "port the remote side should use for fastboot")
+	proxyPort := fs.Int("adb-proxy-port", remote.DefaultProxyPort,
+		"local port the adb traffic lands on; 5038 is radb's proxy, 5037 the bare adb server")
 	fs.Parse(args)
 
 	rest := fs.Args()
@@ -123,9 +169,13 @@ func link(ctx context.Context, args []string, log *slog.Logger) error {
 
 	t := &remote.Tunnel{
 		Target: rest[0],
-		Ports:  []int{*adbPort, *fbPort},
-		Args:   rest[1:], // anything further goes straight to ssh
-		Log:    log,
+		Forwards: []remote.Forward{
+			// The remote keeps adb's usual port; locally it lands on the proxy.
+			{Remote: *adbPort, Local: *proxyPort},
+			{Remote: *fbPort, Local: *fbPort},
+		},
+		Args: rest[1:], // anything further goes straight to ssh
+		Log:  log,
 	}
 	return t.Run(ctx)
 }
