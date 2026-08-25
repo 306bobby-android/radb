@@ -29,7 +29,7 @@ against ports that ssh puts on its loopback.
 
 On the device host:
 
-- `radb`, built with Go and libusb: `go build -o ~/bin/radb ./cmd/radb`
+- `radb`, built with Go and libusb: `go build -o ~/.local/bin/radb ./cmd/radb`
 - `adb`, whose server radb proxies
 - the device, and a login session (see the note on USB permissions below)
 
