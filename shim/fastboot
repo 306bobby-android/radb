@@ -1,0 +1,41 @@
+#!/bin/sh
+# Put this directory early on PATH on the remote machine and plain `fastboot`
+# reaches the bridged device, so nothing -- an agent included -- has to remember
+# the -s flag. Override the real binary with RADB_REAL_FASTBOOT if the search
+# below picks the wrong one.
+set -eu
+
+target=${RADB_FASTBOOT:-tcp:127.0.0.1:5554}
+self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+real=${RADB_REAL_FASTBOOT:-}
+if [ -z "$real" ]; then
+    oldifs=$IFS
+    IFS=:
+    for dir in $PATH; do
+        IFS=$oldifs
+        [ -n "$dir" ] || dir=.
+        [ -x "$dir/fastboot" ] || { IFS=:; continue; }
+        # Skip ourselves, or the shim would exec itself forever.
+        if [ "$(cd "$dir" && pwd)/fastboot" != "$self" ]; then
+            real=$dir/fastboot
+            break
+        fi
+        IFS=:
+    done
+    IFS=$oldifs
+fi
+
+if [ -z "$real" ]; then
+    echo "fastboot shim: no real fastboot found on PATH; set RADB_REAL_FASTBOOT" >&2
+    exit 127
+fi
+
+# An explicit -s wins: the caller already knows which device it wants.
+for arg in "$@"; do
+    if [ "$arg" = "-s" ]; then
+        exec "$real" "$@"
+    fi
+done
+
+exec "$real" -s "$target" "$@"
