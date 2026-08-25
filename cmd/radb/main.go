@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,8 +30,8 @@ import (
 const usage = `radb lends a USB-attached Android device to a remote machine.
 
 Run on the machine with the device plugged in:
-  radb serve                 serve the fastboot bridge and start the adb server
-  radb link USER@HOST        hold an ssh reverse tunnel open to the remote box
+  radb link USER@HOST        bring it all up: bridge, adb proxy and ssh tunnel
+  radb serve                 only the local half, for tunnelling some other way
   radb devices               list bootloaders visible on USB
   radb doctor                check both halves of the setup
 
@@ -40,7 +42,7 @@ Use "radb COMMAND -h" for the flags of a command.
 `
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := newLogger(false)
 
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
@@ -52,10 +54,10 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
-	case "serve":
-		err = serve(ctx, os.Args[2:], log)
 	case "link":
 		err = link(ctx, os.Args[2:], log)
+	case "serve":
+		err = serve(ctx, os.Args[2:], log)
 	case "devices":
 		err = devices()
 	case "doctor":
@@ -75,56 +77,75 @@ func main() {
 	}
 }
 
-func serve(ctx context.Context, args []string, log *slog.Logger) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", fmt.Sprintf("127.0.0.1:%d", remote.DefaultFastbootPort),
-		"address for the fastboot bridge; loopback is right when an ssh tunnel carries it")
-	serial := fs.String("s", "", "USB serial of the bootloader to bridge, when several are attached")
-	timeout := fs.Duration("timeout", 10*time.Minute, "bound on a single USB transfer")
-	startADB := fs.Bool("adb", true, "also make sure the local adb server is running")
-	proxyAddr := fs.String("adb-proxy", fmt.Sprintf("127.0.0.1:%d", remote.DefaultProxyPort),
-		"address for the adb proxy that the tunnel should point at; empty to disable it")
-	upstream := fs.String("adb-upstream", fmt.Sprintf("127.0.0.1:%d", remote.DefaultADBPort),
-		"the real adb server the proxy forwards to")
-	inject := fs.Bool("inject", true,
-		"let the proxy add explanatory entries to `adb devices` for states that would otherwise be an empty list")
-	verbose := fs.Bool("v", false, "log every fastboot command")
-	fs.Parse(args)
-
-	if *verbose {
-		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+func newLogger(verbose bool) *slog.Logger {
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
 	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
 
-	if *startADB {
-		// adb listens on 127.0.0.1:5037 by default, which is exactly what the
-		// tunnel forwards, so there is nothing to configure -- just make sure
-		// it is up before the remote client tries to reach it.
+// localOpts configures the half of radb that runs on the machine holding the
+// device: the fastboot bridge, the adb proxy, and the adb server behind it.
+type localOpts struct {
+	fastbootAddr string
+	proxyAddr    string
+	upstream     string
+	serial       string
+	timeout      time.Duration
+	startADB     bool
+	inject       bool
+}
+
+// bindLocalFlags registers the options that serve and link share.
+func bindLocalFlags(fs *flag.FlagSet, o *localOpts) {
+	fs.StringVar(&o.fastbootAddr, "addr", fmt.Sprintf("127.0.0.1:%d", remote.DefaultFastbootPort),
+		"address for the fastboot bridge; loopback is right when a tunnel carries it")
+	fs.StringVar(&o.proxyAddr, "adb-proxy", fmt.Sprintf("127.0.0.1:%d", remote.DefaultProxyPort),
+		"address for the adb proxy the tunnel points at; empty to skip it")
+	fs.StringVar(&o.upstream, "adb-upstream", fmt.Sprintf("127.0.0.1:%d", remote.DefaultADBPort),
+		"the real adb server the proxy forwards to")
+	fs.StringVar(&o.serial, "s", "", "USB serial of the bootloader to bridge, when several are attached")
+	fs.DurationVar(&o.timeout, "timeout", 10*time.Minute, "bound on a single USB transfer")
+	fs.BoolVar(&o.startADB, "adb", true, "also make sure the local adb server is running")
+	fs.BoolVar(&o.inject, "inject", true,
+		"let the proxy explain states that would otherwise be an empty `adb devices`")
+}
+
+// startLocal brings up the bridge and the proxy. The ports are bound before it
+// returns, so a port already in use is reported straight away rather than after
+// a tunnel has been built around it. The returned channel carries the first
+// failure from either component.
+func startLocal(ctx context.Context, o localOpts, log *slog.Logger) (<-chan error, error) {
+	if o.startADB {
+		// adb listens on 127.0.0.1:5037 by default, which is what the proxy
+		// forwards to, so there is nothing to configure -- just make sure it is
+		// up before a remote client comes looking.
 		if out, err := exec.Command("adb", "start-server").CombinedOutput(); err != nil {
 			log.Warn("could not start the adb server", "err", err, "output", strings.TrimSpace(string(out)))
 		} else {
-			log.Info("adb server ready", "addr", fmt.Sprintf("127.0.0.1:%d", remote.DefaultADBPort))
+			log.Info("adb server ready", "addr", o.upstream)
 		}
 	}
 
-	ln, err := net.Listen("tcp", *addr)
+	fbLn, err := net.Listen("tcp", o.fastbootAddr)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", *addr, err)
+		return nil, fmt.Errorf("listen on %s: %w", o.fastbootAddr, err)
 	}
-	defer ln.Close()
-	log.Info("fastboot bridge listening", "addr", ln.Addr().String())
 
-	b := &fastboot.Bridge{Serial: *serial, Timeout: *timeout, Log: log}
+	b := &fastboot.Bridge{Serial: o.serial, Timeout: o.timeout, Log: log}
+	errs := make(chan error, 2)
 
-	if *proxyAddr != "" {
-		pln, err := net.Listen("tcp", *proxyAddr)
+	if o.proxyAddr != "" {
+		pLn, err := net.Listen("tcp", o.proxyAddr)
 		if err != nil {
-			return fmt.Errorf("listen on %s: %w", *proxyAddr, err)
+			fbLn.Close()
+			return nil, fmt.Errorf("listen on %s: %w", o.proxyAddr, err)
 		}
-		defer pln.Close()
 		p := &adbproxy.Proxy{
-			Upstream: *upstream,
+			Upstream: o.upstream,
 			Log:      log,
-			Inject:   *inject,
+			Inject:   o.inject,
 			// A device sitting in the bootloader is invisible to adb, which is
 			// why a remote `adb devices` goes quiet at exactly the moment you
 			// most want to know what happened to it.
@@ -143,43 +164,123 @@ func serve(ctx context.Context, args []string, log *slog.Logger) error {
 				return out
 			},
 		}
-		log.Info("adb proxy listening", "addr", pln.Addr().String(), "upstream", *upstream)
-		go func() {
-			if err := p.Serve(ctx, pln); err != nil {
-				log.Error("adb proxy stopped", "err", err)
-			}
-		}()
+		log.Info("adb proxy listening", "addr", pLn.Addr().String(), "upstream", o.upstream)
+		go func() { errs <- p.Serve(ctx, pLn) }()
 	}
 
-	return b.Serve(ctx, ln)
+	log.Info("fastboot bridge listening", "addr", fbLn.Addr().String())
+	go func() { errs <- b.Serve(ctx, fbLn) }()
+	return errs, nil
 }
 
+// serve runs only the local half. Use it when something other than radb -- a
+// VPN, a hand-rolled tunnel, a systemd unit -- carries the ports.
+func serve(ctx context.Context, args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	var o localOpts
+	bindLocalFlags(fs, &o)
+	verbose := fs.Bool("v", false, "log every fastboot command")
+	fs.Parse(args)
+	if *verbose {
+		log = newLogger(true)
+	}
+
+	errs, err := startLocal(ctx, o, log)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errs:
+		return err
+	}
+}
+
+// link is the whole thing in one command: the local half plus the ssh reverse
+// tunnel that carries it to the remote machine.
 func link(ctx context.Context, args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("link", flag.ExitOnError)
+	var o localOpts
+	bindLocalFlags(fs, &o)
 	adbPort := fs.Int("adb-port", remote.DefaultADBPort, "port the remote side should use for adb")
 	fbPort := fs.Int("fastboot-port", remote.DefaultFastbootPort, "port the remote side should use for fastboot")
-	proxyPort := fs.Int("adb-proxy-port", remote.DefaultProxyPort,
-		"local port the adb traffic lands on; 5038 is radb's proxy, 5037 the bare adb server")
-	fbLocal := fs.Int("fastboot-local-port", remote.DefaultFastbootPort,
-		"local port the fastboot bridge listens on")
+	withServe := fs.Bool("serve", true, "also run the bridge and proxy here; -serve=false if they already run")
+	verbose := fs.Bool("v", false, "log every fastboot command")
 	fs.Parse(args)
+	if *verbose {
+		log = newLogger(true)
+	}
 
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return fmt.Errorf("link needs an ssh destination, e.g. radb link me@build-box")
+		return errors.New("link needs an ssh destination, e.g. radb link me@build-box")
+	}
+
+	// The remote keeps the ports its tools expect; locally they land on
+	// whatever this process is actually listening on.
+	adbLocal, err := portOf(o.proxyAddr)
+	if err != nil {
+		// With the proxy off, the tunnel has to reach the adb server itself.
+		if adbLocal, err = portOf(o.upstream); err != nil {
+			return fmt.Errorf("cannot tell which local port carries adb: %w", err)
+		}
+	}
+	fbLocal, err := portOf(o.fastbootAddr)
+	if err != nil {
+		return fmt.Errorf("cannot tell which local port carries fastboot: %w", err)
+	}
+
+	errs := make(chan error, 2)
+	if *withServe {
+		local, err := startLocal(ctx, o, log)
+		if err != nil {
+			return err
+		}
+		go func() { errs <- <-local }()
 	}
 
 	t := &remote.Tunnel{
 		Target: rest[0],
 		Forwards: []remote.Forward{
-			// The remote keeps adb's usual port; locally it lands on the proxy.
-			{Remote: *adbPort, Local: *proxyPort},
-			{Remote: *fbPort, Local: *fbLocal},
+			{Remote: *adbPort, Local: adbLocal},
+			{Remote: *fbPort, Local: fbLocal},
 		},
 		Args: rest[1:], // anything further goes straight to ssh
 		Log:  log,
 	}
-	return t.Run(ctx)
+	tunnel := make(chan error, 1)
+	go func() { tunnel <- t.Run(ctx) }()
+
+	select {
+	case err := <-errs:
+		return err
+	case err := <-tunnel:
+		return err
+	case <-ctx.Done():
+	}
+
+	// Shutting down: give ssh time to go away first. Exiting ahead of it
+	// orphans it still holding the forwards, and the next link cannot bind
+	// them until the server notices and lets go.
+	select {
+	case <-tunnel:
+	case <-time.After(5 * time.Second):
+		log.Warn("ssh has not exited; a forward may linger on the remote briefly")
+	}
+	return nil
+}
+
+// portOf pulls the port number out of a host:port address.
+func portOf(addr string) (int, error) {
+	if addr == "" {
+		return 0, errors.New("no address given")
+	}
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(p)
 }
 
 func devices() error {

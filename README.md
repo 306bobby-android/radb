@@ -41,13 +41,18 @@ On the remote server:
 
 ## Use
 
-Two commands on the device host, one per terminal:
+One command on the device host:
 
-    radb serve                 # fastboot bridge (5554) and adb proxy (5038)
-    radb link me@build-box     # ssh reverse forwards, reconnecting as needed
+    radb link me@build-box
 
-`serve` leaves the real adb server alone on 5037; `link` points the remote's
-5037 at the proxy on 5038 and the remote's 5554 at the bridge.
+That starts the adb server if it is not up, the adb proxy on 5038, the fastboot
+bridge on 5554, and an ssh reverse tunnel that reconnects on its own. The real
+adb server keeps 5037 to itself, so anything local carries on unaffected; the
+tunnel points the remote's 5037 at the proxy and its 5554 at the bridge.
+
+`radb serve` runs just the local half, for when something else -- a VPN, a
+systemd unit, your own ssh -- carries the ports. `radb link -serve=false` is the
+other side of that, when the local half is already running.
 
 Then on the remote server:
 

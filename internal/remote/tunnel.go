@@ -60,6 +60,11 @@ func (t *Tunnel) command(ctx context.Context) *exec.Cmd {
 	args = append(args, t.Target)
 
 	cmd := exec.CommandContext(ctx, "ssh", args...)
+	// Ask ssh to close the connection rather than killing it outright, so the
+	// server drops the forwards straight away instead of waiting to notice a
+	// dead peer. WaitDelay is the backstop if it ignores that.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 3 * time.Second
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	return cmd
