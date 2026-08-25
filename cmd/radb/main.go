@@ -22,9 +22,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bobbypanarisi/radb/internal/adbproxy"
-	"github.com/bobbypanarisi/radb/internal/fastboot"
-	"github.com/bobbypanarisi/radb/internal/remote"
+	"github.com/306bobby-android/radb/internal/adbproxy"
+	"github.com/306bobby-android/radb/internal/fastboot"
+	"github.com/306bobby-android/radb/internal/remote"
 )
 
 const usage = `radb lends a USB-attached Android device to a remote machine.

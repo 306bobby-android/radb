@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bobbypanarisi/radb/internal/fastboot"
-	"github.com/bobbypanarisi/radb/internal/remote"
+	"github.com/306bobby-android/radb/internal/fastboot"
+	"github.com/306bobby-android/radb/internal/remote"
 )
 
 // doctor reports on each moving part of the setup, in the order a failure would

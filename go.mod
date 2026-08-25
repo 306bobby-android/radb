@@ -1,4 +1,4 @@
-module github.com/bobbypanarisi/radb
+module github.com/306bobby-android/radb
 
 go 1.24
 
