@@ -211,7 +211,8 @@ export ADB_SERVER_SOCKET=tcp:127.0.0.1:%d
 # fastboot has no such variable; it takes the device on the command line.
 # Either pass it yourself:
 #     fastboot -s "$RADB_FASTBOOT" getvar product
-# or put the shim from radb/shim/fastboot early on your PATH and forget about it.
+# or copy radb/shim/rfastboot onto your PATH and use that instead:
+#     rfastboot getvar product
 export RADB_FASTBOOT=tcp:127.0.0.1:%d
 `, *adbPort, *fbPort)
 	return nil

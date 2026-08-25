@@ -3,16 +3,16 @@
 Lend a USB-attached Android device to a machine that cannot reach it, so stock
 `adb` and `fastboot` running there drive it as if it were plugged in.
 
-Built for the case where the device is on a desktop and the work — an agent, a
-build, a test run — happens on a remote server.
+Built for the case where the device is on a desktop and the work -- an agent, a
+build, a test run -- happens on a remote server.
 
 ## Why there are two halves
 
 **adb needs no protocol work.** `adb` is already split into a client and a
 server that talk over TCP, and the client will happily talk to a server on
-another host. Point `ADB_SERVER_SOCKET` at a tunnelled port 5037 and
-`shell`, `push`, `pull`, `install` and `logcat` all work — file transfer
-included, since it rides the same connection.
+another host. Point `ADB_SERVER_SOCKET` at a tunnelled port 5037 and `shell`,
+`push`, `pull`, `install` and `logcat` all work -- file transfer included, since
+it rides the same connection.
 
 **fastboot has no such split.** It drives USB directly. But it *does* know how
 to reach a bootloader over TCP (`fastboot -s tcp:HOST:PORT`), and that protocol
@@ -21,40 +21,88 @@ unsigned eight byte big-endian length. So `radb serve` pretends to be a
 network-attached bootloader and relays each packet to the real one over USB.
 The `fastboot` binary on the remote machine is stock and unmodified.
 
-## Install
+## What goes where
 
-Needs Go and libusb.
+**radb only ever runs on the machine with the device.** The remote server needs
+no part of it -- no Go, no libusb, no root, no daemon. It runs the stock tools
+against ports that ssh puts on its loopback.
 
-    go build -o ~/bin/radb ./cmd/radb
+On the device host:
+
+- `radb`, built with Go and libusb: `go build -o ~/bin/radb ./cmd/radb`
+- `adb`, whose server radb proxies
+- the device, and a login session (see the note on USB permissions below)
+
+On the remote server:
+
+- `adb` and `fastboot` from platform-tools
+- `adb version` must report the same number as it does on the device host
+- optionally `shim/rfastboot`, a single shell script, copied anywhere on `PATH`
 
 ## Use
 
-On the machine with the device plugged in:
+Two commands on the device host, one per terminal:
 
     radb serve                 # fastboot bridge (5554) and adb proxy (5038)
-    radb link me@build-box     # ssh reverse tunnel, kept alive
+    radb link me@build-box     # ssh reverse forwards, reconnecting as needed
 
-On the remote machine:
+`serve` leaves the real adb server alone on 5037; `link` points the remote's
+5037 at the proxy on 5038 and the remote's 5554 at the bridge.
+
+Then on the remote server:
 
     export ADB_SERVER_SOCKET=tcp:127.0.0.1:5037
     export RADB_FASTBOOT=tcp:127.0.0.1:5554
 
     adb shell getprop ro.product.model
+    adb push ./build/app.apk /data/local/tmp/
     fastboot -s "$RADB_FASTBOOT" getvar product
 
-Copy `shim/fastboot` somewhere early on the remote `PATH` and the `-s` flag
-stops being your problem — plain `fastboot ...` reaches the bridged device,
-which matters when the thing typing the commands is an agent that has read the
-normal fastboot documentation.
+Use `127.0.0.1` rather than `localhost`: ssh binds the forward on IPv4 only, so
+a client that resolves `localhost` to `::1` first will find nothing there.
+
+Nothing special is needed in the server's sshd config. The forwards bind its
+loopback, which stock `AllowTcpForwarding yes` and `GatewayPorts no` already
+permit.
 
 `radb doctor` checks each moving part and prints the remote-side setup.
 
+### rfastboot
+
+`adb` picks the device up from the environment, but `fastboot` has no equivalent
+variable -- it only takes a device on the command line, so `-s` has to be on
+every invocation, and forgetting it produces `no devices/emulators found`, which
+reads like an unplugged phone rather than a missing flag.
+
+`shim/rfastboot` supplies it:
+
+    rfastboot getvar product
+    rfastboot flash boot boot.img
+
+Copy it anywhere on the remote `PATH`. It deliberately does not shadow
+`fastboot`, so the real binary still means the real binary and a server with its
+own USB devices behaves normally. An explicit `-s` passes straight through, and
+`RADB_REAL_FASTBOOT` pins which binary it wraps.
+
 ## Things that will bite you
 
-**The adb client and server versions must match.** A client that finds a server
-of a different version kills it and starts its own — which it cannot do across a
-tunnel, so a version skew shows up as a connection that dies on every command.
-`radb doctor` prints the local version to compare against.
+**A mismatched adb client will try to kill your adb server.** This is the one
+failure worth understanding, because the client does real damage before it
+reports anything useful. When the version it expects differs from the server's,
+it sends `host:kill` and starts a replacement -- which across a tunnel means it
+takes down the server every other session is using and cannot put one back.
+
+`radb serve` therefore puts a proxy in front of the adb server and points the
+tunnel at that instead. The proxy refuses `host:kill`, so the server survives,
+and answers with a message the client prints verbatim:
+
+    adb server version (40) doesn't match this client (41); killing...
+    error: radb refused to kill this adb server: it is shared over a tunnel and
+    other sessions depend on it. Your adb disagrees with its version (this server
+    reports 40), so install platform-tools whose adb matches and retry.
+
+The proxy never rewrites the version itself. That number is a compatibility
+contract, and lying about it would trade a loud failure for a quiet one.
 
 **`fastboot reboot bootloader` and `reboot fastboot` report failure even when
 they work.** After the reboot the client waits for the device to come back, and
@@ -107,10 +155,10 @@ strictly enough to object.
 
 A Pixel 5 (`redfin`), unlocked, over the bridge with stock `fastboot` 37.0.0:
 
-- `getvar` including `getvar all` — 186 INFO lines relayed in order
-- download data phase — `stage` of 32 MiB at ~18 MB/s
-- upload data phase — `fetch vendor_boot_b`, 96 MiB, twice, byte-identical
-  (`sha256 eb3058d8…`), ~40 MB/s
+- `getvar` including `getvar all` -- 186 INFO lines relayed in order
+- download data phase -- `stage` of 32 MiB at ~18 MB/s
+- upload data phase -- `fetch vendor_boot_b`, 96 MiB, twice, byte-identical
+  (`sha256 eb3058d8...`), ~40 MB/s
 - `FAIL` relaying, `reboot`, `reboot fastboot`
 
 The adb half was checked against a real client driven into a genuine version
@@ -121,12 +169,6 @@ the client printed the explanation above.
 The whole path was then run over a real ssh reverse tunnel into a throwaway sshd
 left at its stock forwarding defaults -- device list, `host-features`, the
 refused kill and its message, and a fastboot command reaching the bridge.
-
-The unit tests cover the packet framing and the command state machine against a
-scripted bootloader, including the invariant that makes `fetch` work: an upload
-payload has to leave as exactly one packet, because the host reads it in chunks
-of up to 1 MiB, its TCP transport never reads across a packet boundary, and its
-`ReadBuffer` treats a short read as fatal.
 
 ## Prior art
 

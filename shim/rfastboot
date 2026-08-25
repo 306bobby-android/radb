@@ -1,0 +1,37 @@
+#!/bin/sh
+# rfastboot runs the real fastboot against the device radb bridges over the
+# network, so `-s tcp:...` does not have to be typed -- or remembered -- on every
+# command. Put it anywhere on PATH on the remote machine.
+#
+#   rfastboot getvar product
+#   rfastboot flash boot boot.img
+#
+# RADB_FASTBOOT changes which bridge it talks to; RADB_REAL_FASTBOOT pins the
+# fastboot binary to use.
+set -eu
+
+target=${RADB_FASTBOOT:-tcp:127.0.0.1:5554}
+real=${RADB_REAL_FASTBOOT:-$(command -v fastboot 2>/dev/null || true)}
+
+if [ -z "$real" ]; then
+    echo "rfastboot: no fastboot on PATH; set RADB_REAL_FASTBOOT to its location" >&2
+    exit 127
+fi
+
+# Refuse to exec ourselves in a loop. This only comes up if fastboot has been
+# symlinked to this script to make the redirect transparent, in which case
+# RADB_REAL_FASTBOOT is how to say where the genuine binary lives.
+resolve() { readlink -f "$1" 2>/dev/null || echo "$1"; }
+if [ "$(resolve "$real")" = "$(resolve "$0")" ]; then
+    echo "rfastboot: '$real' is this script; set RADB_REAL_FASTBOOT to the real fastboot" >&2
+    exit 127
+fi
+
+# An explicit -s wins: the caller already knows which device it wants.
+for arg in "$@"; do
+    if [ "$arg" = "-s" ]; then
+        exec "$real" "$@"
+    fi
+done
+
+exec "$real" -s "$target" "$@"
