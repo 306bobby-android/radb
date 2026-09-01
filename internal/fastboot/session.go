@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The four response tags a bootloader can put at the head of a packet, plus
@@ -78,14 +79,21 @@ func (s *Session) Serve(ctx context.Context) error {
 
 // command forwards one command and everything the bootloader says in reply,
 // including any data phase the reply asks for.
+//
+// Each command is logged with what the bootloader finally said about it, since
+// on the remote side that verdict is all anyone sees -- and for a flash or an
+// erase, the timing is the only sign of progress this end has.
 func (s *Session) command(ctx context.Context, cmd string) error {
-	s.log.Debug("command", "cmd", cmd)
+	start := time.Now()
 	if err := s.dev.Send(ctx, []byte(cmd)); err != nil {
+		s.log.Warn("fastboot", "cmd", clipStr(cmd), "err", err)
 		return err
 	}
+	var moved uint64
 	for {
 		resp, err := s.readResponse(ctx)
 		if err != nil {
+			s.log.Warn("fastboot", "cmd", clipStr(cmd), "err", err)
 			return err
 		}
 		if err := s.w.Send(resp); err != nil {
@@ -99,6 +107,7 @@ func (s *Session) command(ctx context.Context, cmd string) error {
 		switch tag {
 		case respINFO, respTEXT:
 			// Progress chatter: the bootloader has more to say.
+			s.log.Debug("fastboot info", "cmd", clipStr(cmd), "text", clipStr(string(resp[4:])))
 			continue
 		case respDATA:
 			size, err := parseDataSize(resp)
@@ -106,11 +115,21 @@ func (s *Session) command(ctx context.Context, cmd string) error {
 				return err
 			}
 			if err := s.dataPhase(ctx, cmd, size); err != nil {
+				s.log.Warn("fastboot", "cmd", clipStr(cmd), "data", size, "err", err)
 				return err
 			}
+			moved += size
 			// A data phase is always followed by a terminal response.
 			continue
 		case respOKAY, respFAIL:
+			args := []any{"cmd", clipStr(cmd), "result", tag, "took", time.Since(start).Round(time.Millisecond)}
+			if msg := strings.TrimSpace(string(resp[4:])); msg != "" {
+				args = append(args, "said", clipStr(msg))
+			}
+			if moved > 0 {
+				args = append(args, "bytes", moved)
+			}
+			s.log.Info("fastboot", args...)
 			return nil
 		default:
 			return fmt.Errorf("bootloader answered %s, which is not a fastboot response", clip(resp))
@@ -234,4 +253,20 @@ func clip(b []byte) string {
 		return strconv.Quote(string(b[:limit])) + "..."
 	}
 	return strconv.Quote(string(b))
+}
+
+// clipStr keeps a log line to one line, whatever the bootloader or an oem
+// passthrough puts in it.
+func clipStr(s string) string {
+	const limit = 120
+	s = strings.TrimRight(s, "\x00")
+	if len(s) > limit {
+		s = s[:limit] + "..."
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 {
+			return ' '
+		}
+		return r
+	}, s)
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/306bobby-android/radb/internal/adbproxy"
 	"github.com/306bobby-android/radb/internal/fastboot"
 	"github.com/306bobby-android/radb/internal/remote"
 )
@@ -40,6 +41,9 @@ func doctor(args []string) error {
 		fmt.Println("  server version tries to kill the server and start its own; the proxy")
 		fmt.Println("  refuses, tells that client why, and records it here.")
 	}
+	fmt.Println()
+	fmt.Println("  To stop radb from the remote machine, without an ssh session back:")
+	fmt.Printf("      adb connect %s\n", adbproxy.ShutdownHost)
 	return nil
 }
 
@@ -77,10 +81,12 @@ func checkProxy(port int) {
 	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
 	ok("adb proxy on %s: %s", addr, lines[0])
 	for _, l := range lines[1:] {
-		if strings.Contains(l, "no client has tried") {
-			ok("%s", l)
+		// The proxy marks the lines worth drawing attention to; everything
+		// else is it reporting that things are as they should be.
+		if rest, flagged := strings.CutPrefix(l, "! "); flagged {
+			warn("%s", rest)
 		} else {
-			warn("%s", l)
+			ok("%s", l)
 		}
 	}
 }

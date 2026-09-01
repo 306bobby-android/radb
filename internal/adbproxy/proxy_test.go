@@ -49,7 +49,9 @@ func startProxy(t *testing.T, p *Proxy) string {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	p.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if p.Log == nil {
+		p.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	go p.Serve(ctx, ln)
 	return ln.Addr().String()
 }

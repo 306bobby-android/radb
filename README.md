@@ -54,6 +54,9 @@ tunnel points the remote's 5037 at the proxy and its 5554 at the bridge.
 systemd unit, your own ssh -- carries the ports. `radb link -serve=false` is the
 other side of that, when the local half is already running.
 
+Either of them gives up after twenty minutes of being no use to anyone; see
+"When it stops" below.
+
 Then on the remote server:
 
     export ADB_SERVER_SOCKET=tcp:127.0.0.1:5037
@@ -88,6 +91,80 @@ Copy it anywhere on the remote `PATH`. It deliberately does not shadow
 `fastboot`, so the real binary still means the real binary and a server with its
 own USB devices behaves normally. An explicit `-s` passes straight through, and
 `RADB_REAL_FASTBOOT` pins which binary it wraps.
+
+## What the log says
+
+radb runs on the device host, and its stderr is the only place either half of
+the link reports anything. There are four kinds of line.
+
+A device arriving or leaving, in either mode. The adb half rides the adb
+server's own `host:track-devices`; the fastboot half is a poll of USB every few
+seconds, because a bootloader is invisible to adb and nothing else would
+mention it:
+
+    msg="adb device connected"    serial=56161FDCH005V4 state=device
+    msg="adb device disconnected" serial=56161FDCH005V4 was=device
+    msg="bootloader connected"    serial=56161FDCH005V4 usb=7-1
+
+Each adb command, with what the server made of it. The service a client asks
+for first is a transport switch that says nothing about the work, so the proxy
+follows it one step and reports the command that arrives behind it on the same
+connection:
+
+    msg=adb peer=127.0.0.1:49064 service=host:tport:any command="shell:getprop ro.product.model" status=OKAY
+
+Each fastboot command, with the bootloader's verdict, how long it took, and how
+much data crossed:
+
+    msg=fastboot cmd=getvar:product result=OKAY took=3ms said=redfin
+    msg=fastboot cmd=flash:boot_a   result=FAIL took=1.2s said="device is locked"
+
+And the refusals and shutdowns, at WARN.
+
+Reading a command out of a spliced connection never holds a byte back: the
+proxy inspects the leading bytes of a stream it is already copying, and copies
+them whether or not it made sense of them.
+
+`-v` adds the bootloader's INFO chatter and the adb bookkeeping -- the
+`host:version` that goes out before every single command -- which is filtered
+out by default for being noise rather than news.
+
+## When it stops
+
+`radb serve` and `radb link` exit on their own after `-idle` (20 minutes by
+default) of being no use, which is either of:
+
+- nothing connected, and nothing since,
+- or no device attached in either mode, for that whole span.
+
+An open connection counts as use even when it is silent, so an `adb shell`
+nobody is typing into and a `fastboot` sitting on a long erase both hold it
+open. Plugging a device in counts as someone arriving, so radb left waiting for
+a phone does not exit seconds after the phone turns up.
+
+The reason for exiting rather than idling is what the far end can see. An ssh
+tunnel to a machine whose phone was unplugged hours ago looks exactly like a
+working one until a command is run through it; an ssh that has gone away does
+not. `-idle 0` stays up regardless.
+
+From the remote machine, this stops radb, the tunnel and both bridges with it:
+
+    adb connect radb-shutdown
+
+There is no adb service for "stop whatever is behind this server", but `adb
+connect` is the one stock command that carries a word of your choosing to the
+server and prints the answer, so the proxy answers that one itself instead of
+passing it on. Nothing is connected to anything; radb replies and exits:
+
+    connected to radb-shutdown: radb is stopping. The tunnel and both bridges
+    go with it; run radb link again on the device host to bring them back.
+
+The wording opens with `connected to` because adb exits non-zero on any other
+answer, and a shutdown that worked should not look like one that failed.
+
+`-remote-shutdown=false` withholds it. Reaching that port already means being
+able to drive the device, so it grants nobody anything new -- but on a box where
+a stray script could take the link down mid-flash, it is worth turning off.
 
 ## Things that will bite you
 
@@ -174,6 +251,13 @@ the client printed the explanation above.
 The whole path was then run over a real ssh reverse tunnel into a throwaway sshd
 left at its stock forwarding defaults -- device list, `host-features`, the
 refused kill and its message, and a fastboot command reaching the bridge.
+
+The logging, the idle timeout and the remote shutdown were checked against a
+Pixel 10 Pro through the proxy with `adb` 1.0.41: `shell`, `push` and a failing
+`shell` each produced one line naming the command and its status, the device was
+reported present at startup, `adb connect radb-shutdown` printed its answer and
+exited 0 with radb gone a moment later, and both idle paths -- no client, and no
+device -- brought it down on their own and said which one had.
 
 ## Prior art
 

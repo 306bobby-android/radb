@@ -8,6 +8,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/306bobby-android/radb/internal/activity"
 )
 
 // Bridge serves the fastboot-over-TCP protocol on a listener and relays each
@@ -22,7 +24,15 @@ type Bridge struct {
 	// usb serialises clients. The bulk endpoints can only be claimed by one
 	// session, and fastboot is strictly one command at a time anyway.
 	usb sync.Mutex
+
+	act activity.Tracker
 }
+
+// Busy reports whether a fastboot client is connected right now.
+func (b *Bridge) Busy() bool { return b.act.Busy() }
+
+// LastActivity is when a fastboot client was most recently served.
+func (b *Bridge) LastActivity() time.Time { return b.act.Last() }
 
 // Serve accepts clients until ctx is cancelled or the listener fails.
 func (b *Bridge) Serve(ctx context.Context, ln net.Listener) error {
@@ -45,7 +55,11 @@ func (b *Bridge) Serve(ctx context.Context, ln net.Listener) error {
 // handle runs one client from handshake to disconnect.
 func (b *Bridge) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	idle := b.act.Begin()
+	defer idle()
 	log := b.Log.With("peer", conn.RemoteAddr().String())
+	log.Info("fastboot client connected")
+	defer log.Info("fastboot client disconnected")
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		// Every command is a small write followed by a read, so Nagle would add
@@ -77,9 +91,7 @@ func (b *Bridge) handle(ctx context.Context, conn net.Conn) {
 	s := NewSession(dev, NewPacketReader(bufio.NewReaderSize(conn, 256<<10)), NewPacketWriter(conn), log)
 	if err := s.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Warn("session ended", "err", err)
-		return
 	}
-	log.Info("client disconnected", "serial", dev.Serial)
 }
 
 // serveNoDevice answers every command with FAIL so the operator is told why the
